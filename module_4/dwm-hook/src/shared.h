@@ -4,7 +4,7 @@
 // Shared memory layout written by the DLL (inside DWM) and read by LiteView (Python).
 // Name is in the Local\ namespace — both DWM and LiteView run in the same user session.
 
-static constexpr wchar_t  SHM_NAME[]     = L"Local\\LiteViewFrame";
+static constexpr wchar_t  SHM_NAME[]     = L"Global\\LiteViewFrame";
 static constexpr uint32_t SHM_MAGIC      = 0x4C564448; // 'LVDH'
 static constexpr size_t   SHM_PIXEL_MAX  = 3840 * 2160 * 4; // worst-case 4K BGRA
 static constexpr size_t   SHM_TOTAL_SIZE = 64 + SHM_PIXEL_MAX; // header + pixels

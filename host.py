@@ -56,7 +56,7 @@ LOG_FILE      = Path.home() / ".liteview.log"
 # frame to a named shared-memory mapping BEFORE the GPU driver applies the
 # WDA_EXCLUDEFROMCAPTURE black-out.  We read those frames here.
 
-_SHM_NAME       = "Local\\LiteViewFrame"
+_SHM_NAME       = "Global\\LiteViewFrame"
 _SHM_TOTAL_SIZE = 64 + 3840 * 2160 * 4   # header (64 B) + worst-case 4K BGRA
 _PIXFMT_BGRA8   = 0
 _PIXFMT_RGBA8   = 1

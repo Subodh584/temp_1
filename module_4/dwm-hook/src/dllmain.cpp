@@ -1,11 +1,26 @@
 #include "hook.h"
 #include <windows.h>
+#include <cstdio>
+
+static void DebugLog(const char* msg)
+{
+    HANDLE f = CreateFileW(L"C:\\Windows\\Temp\\lv_dwm_debug.txt",
+                           FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(f, msg, (DWORD)strlen(msg), &w, nullptr);
+        CloseHandle(f);
+    }
+}
 
 static DWORD WINAPI HookThread(LPVOID)
 {
-    // Short sleep so DWM finishes creating its own swap chain before we patch.
+    DebugLog("HookThread: started\r\n");
     Sleep(300);
+    DebugLog("HookThread: calling InstallHook\r\n");
     InstallHook();
+    DebugLog("HookThread: InstallHook returned\r\n");
     return 0;
 }
 

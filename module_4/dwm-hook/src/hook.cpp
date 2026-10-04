@@ -22,6 +22,8 @@
 #include <wrl/client.h>
 #include <cstring>
 
+extern void DebugLog(const char* msg);
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
@@ -59,20 +61,27 @@ static DXGI_FORMAT g_stagingFmt = DXGI_FORMAT_UNKNOWN;
 // --------------------------------------------------------------------------
 static bool OpenSharedMemory()
 {
+    DebugLog("OpenSharedMemory: CreateFileMappingW...\r\n");
     g_hMap = CreateFileMappingW(
         INVALID_HANDLE_VALUE, nullptr,
         PAGE_READWRITE,
         0, static_cast<DWORD>(SHM_TOTAL_SIZE),
         SHM_NAME);
-    if (!g_hMap) return false;
-
+    if (!g_hMap) {
+        char buf[64];
+        wsprintfA(buf, "OpenSharedMemory: FAILED err=%lu\r\n", GetLastError());
+        DebugLog(buf);
+        return false;
+    }
+    DebugLog("OpenSharedMemory: MapViewOfFile...\r\n");
     void* p = MapViewOfFile(g_hMap, FILE_MAP_WRITE, 0, 0, SHM_TOTAL_SIZE);
-    if (!p) { CloseHandle(g_hMap); g_hMap = nullptr; return false; }
+    if (!p) { CloseHandle(g_hMap); g_hMap = nullptr; DebugLog("MapViewOfFile FAILED\r\n"); return false; }
 
     g_header = static_cast<FrameHeader*>(p);
     g_pixels = reinterpret_cast<uint8_t*>(g_header) + sizeof(FrameHeader);
     ZeroMemory(g_header, sizeof(FrameHeader));
     g_header->magic = SHM_MAGIC;
+    DebugLog("OpenSharedMemory: OK\r\n");
     return true;
 }
 
@@ -210,28 +219,30 @@ static bool PatchVTable(void** vtable, int idx, void* newFn, void** origOut)
 // --------------------------------------------------------------------------
 void InstallHook()
 {
-    if (!OpenSharedMemory()) return;
+    DebugLog("InstallHook: start\r\n");
+    if (!OpenSharedMemory()) { DebugLog("InstallHook: OpenSharedMemory FAILED\r\n"); return; }
 
-    // Use a WARP (software) D3D11 device so we never contend for the GPU
-    // adapter that dwm.exe already holds, and so we don't need to create a
-    // visible window (which fails in dwm.exe's window station).
+    DebugLog("InstallHook: D3D11CreateDevice (WARP)...\r\n");
     ComPtr<ID3D11Device> dummyDev;
     D3D_FEATURE_LEVEL    fl;
     HRESULT hr = D3D11CreateDevice(
         nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION,
         &dummyDev, &fl, nullptr);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        char buf[64]; wsprintfA(buf, "InstallHook: D3D11CreateDevice FAILED hr=0x%08X\r\n", hr);
+        DebugLog(buf); return;
+    }
 
-    // Walk the device → adapter → factory chain to reach IDXGIFactory2.
+    DebugLog("InstallHook: getting DXGI factory...\r\n");
     ComPtr<IDXGIDevice>   dxgiDev;
     ComPtr<IDXGIAdapter>  dxgiAdapter;
     ComPtr<IDXGIFactory2> factory;
-    if (FAILED(dummyDev.As(&dxgiDev)))                          return;
-    if (FAILED(dxgiDev->GetAdapter(&dxgiAdapter)))              return;
-    if (FAILED(dxgiAdapter->GetParent(IID_PPV_ARGS(&factory)))) return;
+    if (FAILED(dummyDev.As(&dxgiDev)))                          { DebugLog("As(IDXGIDevice) FAILED\r\n"); return; }
+    if (FAILED(dxgiDev->GetAdapter(&dxgiAdapter)))              { DebugLog("GetAdapter FAILED\r\n"); return; }
+    if (FAILED(dxgiAdapter->GetParent(IID_PPV_ARGS(&factory)))) { DebugLog("GetParent FAILED\r\n"); return; }
 
-    // CreateSwapChainForComposition needs no HWND — safe inside dwm.exe.
+    DebugLog("InstallHook: CreateSwapChainForComposition...\r\n");
     DXGI_SWAP_CHAIN_DESC1 scd{};
     scd.Width        = 1;
     scd.Height       = 1;
@@ -246,17 +257,18 @@ void InstallHook()
     ComPtr<IDXGISwapChain1> dummySC;
     hr = factory->CreateSwapChainForComposition(
              dummyDev.Get(), &scd, nullptr, &dummySC);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        char buf[64]; wsprintfA(buf, "InstallHook: CreateSCForComp FAILED hr=0x%08X\r\n", hr);
+        DebugLog(buf); return;
+    }
 
-    // Patch vtable[8]  = IDXGISwapChain::Present
-    // Patch vtable[22] = IDXGISwapChain1::Present1
-    // Both share the same COM vtable in DXGI.dll .rdata — one patch affects
-    // every IDXGISwapChain instance in this process, including DWM's real one.
+    DebugLog("InstallHook: patching vtable...\r\n");
     void** vtable = *reinterpret_cast<void***>(dummySC.Get());
     PatchVTable(vtable,  8, reinterpret_cast<void*>(HookedPresent),
                 reinterpret_cast<void**>(&g_origPresent));
     PatchVTable(vtable, 22, reinterpret_cast<void*>(HookedPresent1),
                 reinterpret_cast<void**>(&g_origPresent1));
+    DebugLog("InstallHook: DONE — hooks active\r\n");
 }
 
 void RemoveHook()
