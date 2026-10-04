@@ -212,49 +212,51 @@ void InstallHook()
 {
     if (!OpenSharedMemory()) return;
 
-    // Create a tiny hidden window so we can make a dummy swap chain.
-    WNDCLASSEXW wc{sizeof(wc)};
-    wc.lpfnWndProc   = DefWindowProcW;
-    wc.hInstance     = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"_LVHookWnd";
-    RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowExW(0, L"_LVHookWnd", L"",
-                                WS_POPUP, 0, 0, 1, 1,
-                                nullptr, nullptr, wc.hInstance, nullptr);
-    if (!hwnd) return;
-
-    // Dummy D3D11 device + IDXGISwapChain — we only need this to read the vtable.
-    ComPtr<ID3D11Device>    dummyDev;
-    ComPtr<IDXGISwapChain>  dummySC;
-    DXGI_SWAP_CHAIN_DESC scd{};
-    scd.BufferCount       = 1;
-    scd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.BufferUsage       = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow      = hwnd;
-    scd.SampleDesc.Count  = 1;
-    scd.Windowed          = TRUE;
-    D3D_FEATURE_LEVEL fl;
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+    // Use a WARP (software) D3D11 device so we never contend for the GPU
+    // adapter that dwm.exe already holds, and so we don't need to create a
+    // visible window (which fails in dwm.exe's window station).
+    ComPtr<ID3D11Device> dummyDev;
+    D3D_FEATURE_LEVEL    fl;
+    HRESULT hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION,
-        &scd, &dummySC, &dummyDev, &fl, nullptr);
-    if (FAILED(hr)) { DestroyWindow(hwnd); return; }
+        &dummyDev, &fl, nullptr);
+    if (FAILED(hr)) return;
+
+    // Walk the device → adapter → factory chain to reach IDXGIFactory2.
+    ComPtr<IDXGIDevice>   dxgiDev;
+    ComPtr<IDXGIAdapter>  dxgiAdapter;
+    ComPtr<IDXGIFactory2> factory;
+    if (FAILED(dummyDev.As(&dxgiDev)))                          return;
+    if (FAILED(dxgiDev->GetAdapter(&dxgiAdapter)))              return;
+    if (FAILED(dxgiAdapter->GetParent(IID_PPV_ARGS(&factory)))) return;
+
+    // CreateSwapChainForComposition needs no HWND — safe inside dwm.exe.
+    DXGI_SWAP_CHAIN_DESC1 scd{};
+    scd.Width        = 1;
+    scd.Height       = 1;
+    scd.Format       = DXGI_FORMAT_B8G8R8A8_UNORM;
+    scd.SampleDesc   = {1, 0};
+    scd.BufferCount  = 2;
+    scd.BufferUsage  = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.SwapEffect   = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    scd.AlphaMode    = DXGI_ALPHA_MODE_UNSPECIFIED;
+    scd.Scaling      = DXGI_SCALING_STRETCH;
+
+    ComPtr<IDXGISwapChain1> dummySC;
+    hr = factory->CreateSwapChainForComposition(
+             dummyDev.Get(), &scd, nullptr, &dummySC);
+    if (FAILED(hr)) return;
 
     // Patch vtable[8]  = IDXGISwapChain::Present
     // Patch vtable[22] = IDXGISwapChain1::Present1
-    // Both share the same COM vtable in DXGI.dll — patching once affects every
-    // IDXGISwapChain instance in this process, including DWM's real swap chain.
+    // Both share the same COM vtable in DXGI.dll .rdata — one patch affects
+    // every IDXGISwapChain instance in this process, including DWM's real one.
     void** vtable = *reinterpret_cast<void***>(dummySC.Get());
     PatchVTable(vtable,  8, reinterpret_cast<void*>(HookedPresent),
                 reinterpret_cast<void**>(&g_origPresent));
     PatchVTable(vtable, 22, reinterpret_cast<void*>(HookedPresent1),
                 reinterpret_cast<void**>(&g_origPresent1));
-
-    // Release dummy objects (vtable lives in DXGI.dll .rdata, not in these objects).
-    dummySC.Reset();
-    dummyDev.Reset();
-    DestroyWindow(hwnd);
-    UnregisterClassW(L"_LVHookWnd", wc.hInstance);
 }
 
 void RemoveHook()
