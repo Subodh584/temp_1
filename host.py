@@ -186,7 +186,9 @@ def _init_dwm_hook(dll_path: Path) -> bool:
 
     print(f"[*] DWM hook: injecting into dwm.exe (PID {dwm_pid}) ...", flush=True)
     if not _inject_dll(dwm_pid, dll_path):
-        print("[!] DWM hook: injection failed — run LiteView as Administrator", flush=True)
+        print("[!] DWM hook: DLL refused by dwm.exe — likely blocked by Code Integrity policy "
+              "(BlockNonMicrosoftBinaries). Run 'Get-ProcessMitigation -Name dwm.exe' to confirm.",
+              flush=True)
         return False
 
     # Give the DLL's hook thread time to install the hook and create the mapping.
@@ -261,9 +263,14 @@ def _inject_dll(pid: int, dll_path: Path) -> bool:
                 k32.VirtualFreeEx(h, addr, 0, 0x8000)
                 return False
             k32.WaitForSingleObject(ht, 5000)
+            # Exit code = LoadLibraryA return value (HMODULE).
+            # 0 means the DLL failed to load (blocked by code integrity policy,
+            # missing dependency, or DllMain returned FALSE).
+            exit_code = ctypes.c_ulong(0)
+            k32.GetExitCodeThread(ht, ctypes.byref(exit_code))
             k32.CloseHandle(ht)
             k32.VirtualFreeEx(h, addr, 0, 0x8000)
-            return True
+            return exit_code.value != 0
         finally:
             k32.CloseHandle(h)
     except Exception:
