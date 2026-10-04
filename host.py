@@ -121,7 +121,8 @@ def _inject_dll(pid: int, dll_path: Path) -> bool:
 
 
 def _capture_bypass_monitor(cb_dir: Path):
-    """Background thread: watch for WDA-protected windows and inject into them."""
+    """Background thread: watch for WDA-protected windows and inject into them.
+    Skips processes that actively resist injection (e.g. HackerRank desktop app)."""
     dll = cb_dir / "payload_dll_persistent.dll"
     if not dll.exists():
         print(f"[!] capture-bypass: {dll} not found — run the install script to download it", flush=True)
@@ -129,19 +130,110 @@ def _capture_bypass_monitor(cb_dir: Path):
 
     print("[*] capture-bypass: monitor started (watching for protected windows)", flush=True)
     injected: set[int] = set()
+    skip: set[int] = set()
     while True:
         for pid in _get_protected_pids():
-            if pid not in injected:
+            if pid not in injected and pid not in skip:
                 if _inject_dll(pid, dll):
                     print(f"[+] capture-bypass: cleared WDA on PID {pid}", flush=True)
                     injected.add(pid)
                 else:
-                    print(
-                        f"[!] capture-bypass: injection failed for PID {pid} — "
-                        "run LiteView as Administrator",
-                        flush=True,
-                    )
+                    skip.add(pid)  # injection-resistant process; don't retry
         time.sleep(2)
+
+
+def _grab_print_window(hwnd: int, max_width: int, quality: int):
+    """Capture hwnd using PrintWindow(PW_RENDERFULLCONTENT) — no injection needed.
+    Works on some WDA-protected apps (e.g. Electron apps with anti-injection).
+    Returns JPEG bytes or None if the window can't be captured this way."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32  = ctypes.windll.user32
+        gdi32   = ctypes.windll.gdi32
+        PW_RENDERFULLCONTENT = 0x00000002
+
+        rect = ctypes.wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w = rect.right  - rect.left
+        h = rect.bottom - rect.top
+        if w <= 0 or h <= 0:
+            return None
+
+        hdc_screen = user32.GetDC(None)
+        hdc_mem    = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp       = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+        gdi32.SelectObject(hdc_mem, hbmp)
+
+        ok = user32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT)
+
+        if ok:
+            # Convert HBITMAP → PIL Image via BITMAPINFOHEADER
+            class BITMAPINFOHEADER(ctypes.Structure):
+                _fields_ = [
+                    ("biSize",          ctypes.wintypes.DWORD),
+                    ("biWidth",         ctypes.wintypes.LONG),
+                    ("biHeight",        ctypes.wintypes.LONG),
+                    ("biPlanes",        ctypes.wintypes.WORD),
+                    ("biBitCount",      ctypes.wintypes.WORD),
+                    ("biCompression",   ctypes.wintypes.DWORD),
+                    ("biSizeImage",     ctypes.wintypes.DWORD),
+                    ("biXPelsPerMeter", ctypes.wintypes.LONG),
+                    ("biYPelsPerMeter", ctypes.wintypes.LONG),
+                    ("biClrUsed",       ctypes.wintypes.DWORD),
+                    ("biClrImportant",  ctypes.wintypes.DWORD),
+                ]
+            bih = BITMAPINFOHEADER()
+            bih.biSize      = ctypes.sizeof(BITMAPINFOHEADER)
+            bih.biWidth     = w
+            bih.biHeight    = -h  # top-down
+            bih.biPlanes    = 1
+            bih.biBitCount  = 32
+            bih.biCompression = 0  # BI_RGB
+            buf = (ctypes.c_char * (w * h * 4))()
+            gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bih), 0)
+            img = Image.frombuffer("RGBA", (w, h), bytes(buf), "raw", "BGRA", 0, 1)
+            img = img.convert("RGB")
+            if img.width > max_width:
+                img = img.resize(
+                    (max_width, round(img.height * max_width / img.width)),
+                    Image.BILINEAR,
+                )
+            out = io.BytesIO()
+            img.save(out, "JPEG", quality=quality)
+            result = out.getvalue()
+        else:
+            result = None
+
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(None, hdc_screen)
+        return result
+    except Exception:
+        return None
+
+
+def _find_protected_hwnds():
+    """Return list of HWNDs that have WDA protection set."""
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+    except Exception:
+        return []
+
+    hwnds = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _cb(hwnd, _):
+        affinity = ctypes.c_uint(0)
+        user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity))
+        if affinity.value != 0:
+            hwnds.append(hwnd)
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return hwnds
 
 
 # ---------------------------------------------------------------- screen capture
@@ -182,10 +274,9 @@ def grab_jpeg(max_width, quality, force):
 
     jpeg = None
 
+    # Tier 1: dxcam (DXGI) — captures GPU-composited frames including hardware video.
+    # Works when WDA has been cleared by the capture-bypass monitor thread.
     if _dxcam_camera is not None:
-        # capture-bypass has (hopefully) already cleared WDA_EXCLUDEFROMCAPTURE
-        # via the persistent DLL, so DXGI can see GPU-composited frames including
-        # hardware-decoded video (Netflix etc.) without any per-frame bypass delay.
         try:
             frame = _dxcam_camera.grab()
             if frame is not None:
@@ -202,9 +293,18 @@ def grab_jpeg(max_width, quality, force):
             print(f"[dxcam] capture error, disabling: {exc}", flush=True)
             _dxcam_camera = None
 
+    # Tier 2: PrintWindow(PW_RENDERFULLCONTENT) on any still-protected window.
+    # No injection — asks the window to render itself via DWM. Works on apps like
+    # HackerRank desktop that resist DLL injection but don't block PrintWindow.
     if jpeg is None:
-        # Fallback: thirdeye BitBlt with its own per-frame WDA bypass.
-        # Works even if capture-bypass injection failed (no Admin) or dxcam is absent.
+        for hwnd in _find_protected_hwnds():
+            pw_jpeg = _grab_print_window(hwnd, max_width, quality)
+            if pw_jpeg:
+                jpeg = pw_jpeg
+                break
+
+    # Tier 3: thirdeye BitBlt with per-frame WDA bypass — universal fallback.
+    if jpeg is None:
         jpeg = _capture.session.capture_to_buffer(_TE_OPTS_BYPASS)
 
     digest = hashlib.blake2b(jpeg, digest_size=16).digest()
