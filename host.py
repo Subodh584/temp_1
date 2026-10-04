@@ -50,26 +50,34 @@ except Exception:  # pragma: no cover - optional integration module
 
 _capture = threading.local()  # thirdeye sessions are not thread-safe; keep one per thread
 
+# ThirdEyeOptions with bypass_protection=True (the default) is what actually
+# makes thirdeye different from a plain BitBlt: before each capture it injects a
+# remote thread into every WDA_MONITOR/WDA_EXCLUDEFROMCAPTURE-protected process
+# via direct NT syscalls, temporarily clears the display affinity, captures, then
+# signals the remote thread to restore it.  We ask for JPEG directly so we skip
+# the BMP->PIL->JPEG roundtrip.
+_TE_OPTS = None  # set once _eye3 is confirmed available
+
 
 def grab_jpeg(max_width, quality, force):
     """Return the screen as JPEG bytes, or None if nothing changed since last grab."""
+    global _TE_OPTS
     if not hasattr(_capture, "session"):
         _capture.session = _eye3.ThirdEyeSession()
         _capture.last_digest = None
+        if _TE_OPTS is None:
+            _TE_OPTS = _eye3.ThirdEyeOptions(
+                format=_eye3.ThirdeyeFormat.JPEG,
+                quality=quality,
+                bypass_protection=True,
+            )
 
-    opts = _eye3.ThirdEyeOptions(format=_eye3.ThirdeyeFormat.BMP, quality=0)
-    bmp_bytes = _capture.session.capture_to_buffer(opts)
-    digest = hashlib.blake2b(bmp_bytes, digest_size=16).digest()
+    jpeg = _capture.session.capture_to_buffer(_TE_OPTS)
+    digest = hashlib.blake2b(jpeg, digest_size=16).digest()
     if digest == _capture.last_digest and not force:
         return None
     _capture.last_digest = digest
-
-    img = Image.open(io.BytesIO(bmp_bytes)).convert("RGB")
-    if img.width > max_width:
-        img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=quality)
-    return buf.getvalue()
+    return jpeg
 
 
 # ---------------------------------------------------------------- input injection
@@ -346,9 +354,11 @@ def main():
         sys.exit("thirdeye (eye3) is not installed. Run: pip install eye3")
     try:
         with _eye3.ThirdEyeSession() as probe:
-            bmp = probe.capture_to_buffer(_eye3.ThirdEyeOptions(format=_eye3.ThirdeyeFormat.BMP, quality=0))
-            from PIL import Image as _PIL
-            img = _PIL.open(io.BytesIO(bmp))
+            # Use JPEG for the probe too — PIL reads dimensions without full decode.
+            test_jpeg = probe.capture_to_buffer(
+                _eye3.ThirdEyeOptions(format=_eye3.ThirdeyeFormat.JPEG, quality=50)
+            )
+            img = Image.open(io.BytesIO(test_jpeg))
             monitor = {"left": 0, "top": 0, "width": img.width, "height": img.height}
     except Exception as exc:
         sys.exit(f"thirdeye failed to capture the screen: {exc}")
