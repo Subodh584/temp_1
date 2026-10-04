@@ -277,6 +277,29 @@ def _inject_dll(pid: int, dll_path: Path) -> bool:
         return False
 
 
+def _get_process_name(pid: int) -> str:
+    """Return the lowercase exe name for a PID, or '' on failure."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return ''
+        buf = ctypes.create_unicode_buffer(260)
+        size = ctypes.c_ulong(260)
+        k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        k32.CloseHandle(h)
+        return buf.value.lower()
+    except Exception:
+        return ''
+
+
+# Process names (substrings, lowercase) that self-terminate on DLL injection.
+# We skip these entirely so they don't close themselves when LiteView starts.
+_INJECTION_RESISTANT = ("hackerrank", "proctorio", "respondus", "examity", "honorlock")
+
+
 def _capture_bypass_monitor(cb_dir: Path):
     """Background thread: watch for WDA-protected windows and inject into them.
     Skips processes that actively resist injection (e.g. HackerRank desktop app)."""
@@ -291,6 +314,10 @@ def _capture_bypass_monitor(cb_dir: Path):
     while True:
         for pid in _get_protected_pids():
             if pid not in injected and pid not in skip:
+                name = _get_process_name(pid)
+                if any(r in name for r in _INJECTION_RESISTANT):
+                    skip.add(pid)  # known anti-injection app; never touch it
+                    continue
                 if _inject_dll(pid, dll):
                     print(f"[+] capture-bypass: cleared WDA on PID {pid}", flush=True)
                     injected.add(pid)

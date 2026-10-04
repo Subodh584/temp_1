@@ -20,13 +20,13 @@ call "%VCVARS%" >nul 2>&1
 if not exist build mkdir build
 
 echo Compiling liteview_dwm_hook.dll...
-cl.exe /nologo /LD /O2 /W3 /EHsc ^
+cl.exe /nologo /LD /O2 /W3 /EHsc /MT ^
     /I src ^
     src\dllmain.cpp src\hook.cpp ^
     /Fe:build\liteview_dwm_hook.dll ^
     /Fo:build\ ^
     /link d3d11.lib dxgi.lib user32.lib kernel32.lib ^
-    /DLL /INCREMENTAL:NO /OPT:REF
+    /DLL /INCREMENTAL:NO /OPT:REF /NODEFAULTLIB:msvcrt.lib
 
 if errorlevel 1 (
     echo.
