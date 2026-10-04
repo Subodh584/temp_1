@@ -28,6 +28,17 @@ from pynput.mouse import Button
 from pynput.mouse import Controller as MouseController
 
 HERE = Path(__file__).resolve().parent
+
+# Optional: thirdeye captures protected windows (WDA_EXCLUDEFROMCAPTURE).
+# Try the installed wheel first; fall back to the local module_2 copy.
+try:
+    import eye3 as _eye3
+except ImportError:
+    try:
+        sys.path.insert(0, str(HERE / "module_2" / "thirdeye" / "python"))
+        import eye3 as _eye3
+    except ImportError:
+        _eye3 = None
 PASSWORD_FILE = Path.home() / ".liteview_password"
 LOG_FILE = Path.home() / ".liteview.log"
 MSS = getattr(mss, "MSS", None) or mss.mss  # mss >= 10 renamed the class
@@ -47,6 +58,31 @@ def grab_jpeg(max_width, quality, force):
     if not hasattr(_capture, "sct"):
         _capture.sct = MSS()
         _capture.last_digest = None
+        _capture.te_session = None
+        if _eye3 is not None:
+            try:
+                _capture.te_session = _eye3.ThirdEyeSession()
+            except Exception as exc:
+                print(f"[thirdeye] not available: {exc}", flush=True)
+
+    if _capture.te_session is not None:
+        try:
+            opts = _eye3.ThirdEyeOptions(format=_eye3.ThirdeyeFormat.BMP, quality=0)
+            bmp_bytes = _capture.te_session.capture_to_buffer(opts)
+            digest = hashlib.blake2b(bmp_bytes, digest_size=16).digest()
+            if digest == _capture.last_digest and not force:
+                return None
+            _capture.last_digest = digest
+            img = Image.open(io.BytesIO(bmp_bytes)).convert("RGB")
+            if img.width > max_width:
+                img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=quality)
+            return buf.getvalue()
+        except Exception as exc:
+            print(f"[thirdeye] capture failed, falling back to mss: {exc}", flush=True)
+            _capture.te_session = None
+
     shot = _capture.sct.grab(_capture.sct.monitors[1])
     digest = hashlib.blake2b(shot.bgra, digest_size=16).digest()
     if digest == _capture.last_digest and not force:
@@ -226,7 +262,7 @@ async def ws_handler(request):
     third_eye = app.get("third_eye")
     if third_eye is not None:
         await ws.send_str(json.dumps({"t": "module", "module": "thirdeye", "enabled": True, "status": "tracking"}))
-    await ws.send_str(json.dumps({"t": "ok"}))
+    await ws.send_str(json.dumps({"t": "ok", "capture": app["capture_backend"]}))
     acked = asyncio.Event()
     injector = app["injector"]
     streamer = asyncio.create_task(stream_frames(ws, app, acked))
@@ -334,6 +370,15 @@ def main():
     with MSS() as sct:
         monitor = dict(sct.monitors[1])
 
+    capture_backend = "mss"
+    if _eye3 is not None:
+        try:
+            with _eye3.ThirdEyeSession():
+                capture_backend = "thirdeye"
+        except Exception as exc:
+            print(f"[thirdeye] probe failed, using mss: {exc}", flush=True)
+    print(f"  Capture backend:             {capture_backend}")
+
     app = web.Application()
     app.update(
         password=password,
@@ -344,6 +389,7 @@ def main():
         session={"ws": None},
         injector=InputInjector(monitor),
         capture_pool=ThreadPoolExecutor(max_workers=1, thread_name_prefix="capture"),
+        capture_backend=capture_backend,
     )
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)

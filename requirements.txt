@@ -2,3 +2,4 @@ aiohttp
 mss
 pillow
 pynput
+eye3; sys_platform == "win32"
