@@ -2,7 +2,7 @@
 #include <windows.h>
 #include <cstdio>
 
-static void DebugLog(const char* msg)
+void DebugLog(const char* msg)
 {
     HANDLE f = CreateFileW(L"C:\\Windows\\Temp\\lv_dwm_debug.txt",
                            FILE_APPEND_DATA, FILE_SHARE_READ,
