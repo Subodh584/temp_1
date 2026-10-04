@@ -112,11 +112,55 @@ class _DWMReader:
 _dwm_reader: "_DWMReader | None" = None
 
 
+def _enable_debug_privilege() -> bool:
+    """Enable SeDebugPrivilege so OpenProcess can open system processes like dwm.exe.
+    The privilege is present in admin tokens but disabled by default."""
+    try:
+        import ctypes, ctypes.wintypes
+        advapi32 = ctypes.windll.advapi32
+        k32 = ctypes.windll.kernel32
+        TOKEN_ADJUST_PRIVILEGES = 0x0020
+        TOKEN_QUERY = 0x0008
+        SE_PRIVILEGE_ENABLED = 0x00000002
+
+        class _LUID(ctypes.Structure):
+            _fields_ = [("LowPart", ctypes.wintypes.DWORD), ("HighPart", ctypes.c_long)]
+
+        class _LUID_ATTR(ctypes.Structure):
+            _fields_ = [("Luid", _LUID), ("Attributes", ctypes.wintypes.DWORD)]
+
+        class _TOKEN_PRIVS(ctypes.Structure):
+            _fields_ = [("PrivilegeCount", ctypes.wintypes.DWORD),
+                        ("Privileges", _LUID_ATTR * 1)]
+
+        hTok = ctypes.wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(k32.GetCurrentProcess(),
+                                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                         ctypes.byref(hTok)):
+            return False
+        luid = _LUID()
+        advapi32.LookupPrivilegeValueW(None, "SeDebugPrivilege", ctypes.byref(luid))
+        tp = _TOKEN_PRIVS()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+        advapi32.AdjustTokenPrivileges(hTok, False, ctypes.byref(tp),
+                                       ctypes.sizeof(tp), None, None)
+        k32.CloseHandle(hTok)
+        return True
+    except Exception:
+        return False
+
+
 def _init_dwm_hook(dll_path: Path) -> bool:
     """Inject liteview_dwm_hook.dll into dwm.exe and open the shared memory."""
     global _dwm_reader
     if not dll_path.exists():
+        print(f"[!] DWM hook: DLL not found at {dll_path}", flush=True)
         return False
+
+    # Enable SeDebugPrivilege — needed to OpenProcess on dwm.exe even as admin.
+    _enable_debug_privilege()
 
     # Find dwm.exe PID.
     try:
@@ -124,7 +168,8 @@ def _init_dwm_hook(dll_path: Path) -> bool:
             ["tasklist", "/FI", "IMAGENAME eq dwm.exe", "/FO", "CSV", "/NH"],
             text=True, timeout=5, stderr=subprocess.DEVNULL,
         )
-    except Exception:
+    except Exception as exc:
+        print(f"[!] DWM hook: tasklist failed: {exc}", flush=True)
         return False
     dwm_pid = None
     for line in out.splitlines():
@@ -136,14 +181,18 @@ def _init_dwm_hook(dll_path: Path) -> bool:
             except ValueError:
                 pass
     if not dwm_pid:
+        print("[!] DWM hook: dwm.exe not found in tasklist", flush=True)
         return False
 
+    print(f"[*] DWM hook: injecting into dwm.exe (PID {dwm_pid}) ...", flush=True)
     if not _inject_dll(dwm_pid, dll_path):
         print("[!] DWM hook: injection failed — run LiteView as Administrator", flush=True)
         return False
 
-    # Give the DLL's background thread time to install the hook and create the mapping.
-    time.sleep(0.6)
+    # Give the DLL's hook thread time to install the hook and create the mapping.
+    # 2 s is generous; the thread only needs ~300 ms but dwm.exe can be slow to load.
+    print("[*] DWM hook: waiting for hook to initialise ...", flush=True)
+    time.sleep(2)
     try:
         _dwm_reader = _DWMReader()
         print("[+] DWM hook: active — all windows capturable (WDA bypassed at compositor level)", flush=True)
