@@ -731,7 +731,11 @@ def main():
     # DWM hook: inject liteview_dwm_hook.dll into dwm.exe so every frame is
     # captured at the compositor level, bypassing WDA for all apps at once.
     # Falls back silently if the DLL hasn't been built yet.
-    _init_dwm_hook(HERE / "module_4" / "dwm-hook" / "build" / "Release" / "liteview_dwm_hook.dll")
+    # DLL can be in build\ (cl.exe direct build) or build\Release\ (cmake build).
+    _dwm_dll = HERE / "module_4" / "dwm-hook" / "build" / "liteview_dwm_hook.dll"
+    if not _dwm_dll.exists():
+        _dwm_dll = HERE / "module_4" / "dwm-hook" / "build" / "Release" / "liteview_dwm_hook.dll"
+    _init_dwm_hook(_dwm_dll)
 
     # Fallback background thread for per-process WDA injection (browsers, etc.)
     # when the DWM hook is not available.

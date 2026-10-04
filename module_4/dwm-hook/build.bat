@@ -1,34 +1,42 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
-rem -- Find cmake: try PATH first, then search inside Visual Studio install --------
-where cmake >nul 2>&1
-if errorlevel 1 (
-    echo cmake not in PATH, searching Visual Studio installation...
-    for /f "tokens=*" %%i in ('powershell -NoProfile -Command ^
-        "Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter cmake.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DirectoryName"') do set "CMAKE_DIR=%%i"
-    if not defined CMAKE_DIR (
-        echo ERROR: cmake.exe not found under 'C:\Program Files\Microsoft Visual Studio'.
-        echo Make sure 'Desktop development with C++' workload is installed in Visual Studio.
-        pause & exit /b 1
-    )
-    set "PATH=%CMAKE_DIR%;%PATH%"
-    echo Using cmake from: %CMAKE_DIR%
+echo Locating Visual Studio...
+
+rem Find vcvars64.bat anywhere under the VS install directory
+for /f "tokens=*" %%i in ('powershell -NoProfile -Command ^
+    "Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter vcvars64.bat -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName"') do set "VCVARS=%%i"
+
+if not defined VCVARS (
+    echo ERROR: Could not find vcvars64.bat.
+    echo Make sure "Desktop development with C++" workload is installed in Visual Studio.
+    pause & exit /b 1
 )
 
+echo Found: %VCVARS%
+call "%VCVARS%" >nul 2>&1
+
 if not exist build mkdir build
-cd build
 
-cmake .. -A x64
-if errorlevel 1 ( echo CMake configure failed. & pause & exit /b 1 )
+echo Compiling liteview_dwm_hook.dll...
+cl.exe /nologo /LD /O2 /W3 /EHsc ^
+    /I src ^
+    src\dllmain.cpp src\hook.cpp ^
+    /Fe:build\liteview_dwm_hook.dll ^
+    /Fo:build\ ^
+    /link d3d11.lib dxgi.lib user32.lib kernel32.lib ^
+    /DLL /INCREMENTAL:NO /OPT:REF
 
-cmake --build . --config Release
-if errorlevel 1 ( echo Build failed. & pause & exit /b 1 )
+if errorlevel 1 (
+    echo.
+    echo Build FAILED.
+    pause & exit /b 1
+)
 
 echo.
 echo Build successful.
-echo Output: %~dp0build\Release\liteview_dwm_hook.dll
+echo Output: %~dp0build\liteview_dwm_hook.dll
 echo.
-echo Copy that DLL next to host.py and re-run the install script (or restart LiteView).
+echo Restart LiteView as Administrator to activate the DWM hook.
 pause
