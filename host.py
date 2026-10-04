@@ -95,46 +95,46 @@ def grab_jpeg(max_width, quality, force):
         _capture.last_digest = None
         _init_capture(quality)
 
+    te_session = _capture.session  # capture for closure — _capture is thread-local
+
     if _dxcam_camera is not None:
         # Two-phase capture:
-        #   1. Run thirdeye's bypass on a background thread — it injects into every
-        #      WDA_EXCLUDEFROMCAPTURE-protected process and holds WDA cleared while
-        #      its own BitBlt runs (~150–300 ms window).
-        #   2. Fire dxcam (DXGI) ~120 ms in, while WDA is still cleared — DXGI can
-        #      then see GPU-composited content (hardware video, DRM windows) that
-        #      BitBlt cannot.
-        bypass_ready = threading.Event()
+        #   1. Run thirdeye's WDA bypass on a background thread. It injects into every
+        #      WDA_EXCLUDEFROMCAPTURE-protected process, clears display affinity, then
+        #      holds it cleared for ~150-300 ms while its own BitBlt runs.
+        #   2. Fire dxcam (DXGI Desktop Duplication) ~120 ms in, while WDA is still
+        #      cleared — DXGI sees the GPU-composited output including hardware video.
         bypass_done = threading.Event()
 
         def run_bypass():
-            bypass_ready.set()
             try:
-                _capture.session.capture_to_buffer(_TE_OPTS_BYPASS_ONLY)
+                te_session.capture_to_buffer(_TE_OPTS_BYPASS_ONLY)
             except Exception:
                 pass
-            bypass_done.set()
+            finally:
+                bypass_done.set()
 
-        t = threading.Thread(target=run_bypass, daemon=True)
-        t.start()
-        bypass_ready.wait()
-        time.sleep(0.12)  # let thirdeye's injections take effect
+        threading.Thread(target=run_bypass, daemon=True).start()
+        time.sleep(0.12)  # let thirdeye's injections take effect (~150 ms window)
 
         frame = _dxcam_camera.grab()
         bypass_done.wait(timeout=1.0)
 
-        if frame is None:
-            return None  # no change detected by dxcam
-
-        img = Image.fromarray(frame)
-        if img.width > max_width:
-            img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=quality)
-        jpeg = buf.getvalue()
+        if frame is not None:
+            # dxcam got a real DXGI frame — encode it
+            img = Image.fromarray(frame)
+            if img.width > max_width:
+                img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=quality)
+            jpeg = buf.getvalue()
+        else:
+            # dxcam returned None (DXGI reported no desktop change) — fall back to
+            # thirdeye's own BitBlt output so we never drop to 0 fps
+            jpeg = te_session.capture_to_buffer(_TE_OPTS_BYPASS)
     else:
-        # dxcam not available: fall back to thirdeye's own BitBlt capture.
-        # Works for WDA-only protected windows; GPU-rendered content stays black.
-        jpeg = _capture.session.capture_to_buffer(_TE_OPTS_BYPASS)
+        # dxcam not available: thirdeye's own BitBlt capture with WDA bypass.
+        jpeg = te_session.capture_to_buffer(_TE_OPTS_BYPASS)
 
     digest = hashlib.blake2b(jpeg, digest_size=16).digest()
     if digest == _capture.last_digest and not force:
