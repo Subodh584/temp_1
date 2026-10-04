@@ -49,7 +49,108 @@ try:
 except ImportError:
     _dxcam = None
 PASSWORD_FILE = Path.home() / ".liteview_password"
-LOG_FILE = Path.home() / ".liteview.log"
+LOG_FILE      = Path.home() / ".liteview.log"
+
+# ---------------------------------------------------------------- DWM hook reader
+# When liteview_dwm_hook.dll is injected into dwm.exe it writes every composited
+# frame to a named shared-memory mapping BEFORE the GPU driver applies the
+# WDA_EXCLUDEFROMCAPTURE black-out.  We read those frames here.
+
+_SHM_NAME       = "Local\\LiteViewFrame"
+_SHM_TOTAL_SIZE = 64 + 3840 * 2160 * 4   # header (64 B) + worst-case 4K BGRA
+_PIXFMT_BGRA8   = 0
+_PIXFMT_RGBA8   = 1
+_PIXFMT_RGB10A2 = 2
+
+class _DWMReader:
+    """Reads frames from the shared memory written by liteview_dwm_hook.dll."""
+    def __init__(self):
+        import ctypes, ctypes.wintypes
+        k32 = ctypes.windll.kernel32
+        self._k32 = k32
+        FILE_MAP_READ = 0x0004
+        self._hMap = k32.OpenFileMappingW(FILE_MAP_READ, False, _SHM_NAME)
+        if not self._hMap:
+            raise OSError("DWM hook shared memory not found")
+        self._ptr = k32.MapViewOfFile(self._hMap, FILE_MAP_READ, 0, 0, _SHM_TOTAL_SIZE)
+        if not self._ptr:
+            k32.CloseHandle(self._hMap)
+            raise OSError("Failed to map DWM shared memory")
+        self._last_frame = 0
+
+    def grab(self):
+        """Return (width, height, format_code, bytes) or None if no new frame."""
+        import ctypes
+        base = self._ptr
+        # Read header fields (offsets match FrameHeader in shared.h)
+        magic    = ctypes.c_uint32.from_address(base +  0).value
+        width    = ctypes.c_uint32.from_address(base +  4).value
+        height   = ctypes.c_uint32.from_address(base +  8).value
+        fmt      = ctypes.c_uint32.from_address(base + 12).value
+        frameNum = ctypes.c_uint64.from_address(base + 16).value
+        ready    = ctypes.c_uint32.from_address(base + 24).value
+
+        if magic != 0x4C564448 or not ready or frameNum == self._last_frame:
+            return None
+        if width == 0 or height == 0:
+            return None
+        pixel_bytes = width * height * 4
+        data = (ctypes.c_uint8 * pixel_bytes).from_address(base + 64)
+        result = (width, height, fmt, bytes(data))
+        self._last_frame = frameNum
+        return result
+
+    def close(self):
+        if self._ptr:
+            self._k32.UnmapViewOfFile(self._ptr)
+            self._ptr = 0
+        if self._hMap:
+            self._k32.CloseHandle(self._hMap)
+            self._hMap = None
+
+
+_dwm_reader: "_DWMReader | None" = None
+
+
+def _init_dwm_hook(dll_path: Path) -> bool:
+    """Inject liteview_dwm_hook.dll into dwm.exe and open the shared memory."""
+    global _dwm_reader
+    if not dll_path.exists():
+        return False
+
+    # Find dwm.exe PID.
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq dwm.exe", "/FO", "CSV", "/NH"],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return False
+    dwm_pid = None
+    for line in out.splitlines():
+        parts = line.split(",")
+        if len(parts) >= 2 and "dwm" in parts[0].lower():
+            try:
+                dwm_pid = int(parts[1].strip('"'))
+                break
+            except ValueError:
+                pass
+    if not dwm_pid:
+        return False
+
+    if not _inject_dll(dwm_pid, dll_path):
+        print("[!] DWM hook: injection failed — run LiteView as Administrator", flush=True)
+        return False
+
+    # Give the DLL's background thread time to install the hook and create the mapping.
+    time.sleep(0.6)
+    try:
+        _dwm_reader = _DWMReader()
+        print("[+] DWM hook: active — all windows capturable (WDA bypassed at compositor level)", flush=True)
+        return True
+    except OSError as exc:
+        print(f"[!] DWM hook: shared memory not ready: {exc}", flush=True)
+        return False
 
 try:
     from module_2.thirdeye import ThirdEyeModule
@@ -274,9 +375,39 @@ def grab_jpeg(max_width, quality, force):
 
     jpeg = None
 
-    # Tier 1: dxcam (DXGI) — captures GPU-composited frames including hardware video.
+    # Tier 1: DWM hook — reads DWM's compositor back buffer via shared memory,
+    # captured BEFORE the GPU driver applies the WDA black-out.  Works on every
+    # app including HackerRank desktop without touching the target process at all.
+    if _dwm_reader is not None:
+        try:
+            frame = _dwm_reader.grab()
+            if frame is not None:
+                w, h, fmt, raw = frame
+                if fmt == _PIXFMT_BGRA8:
+                    import numpy as np
+                    arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)
+                    img = Image.fromarray(arr[:, :, [2, 1, 0]], "RGB")  # BGRA→RGB
+                elif fmt == _PIXFMT_RGBA8:
+                    import numpy as np
+                    arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 4)
+                    img = Image.fromarray(arr[:, :, :3], "RGB")
+                else:
+                    img = None
+                if img is not None:
+                    if img.width > max_width:
+                        img = img.resize(
+                            (max_width, round(img.height * max_width / img.width)),
+                            Image.BILINEAR,
+                        )
+                    buf = io.BytesIO()
+                    img.save(buf, "JPEG", quality=quality)
+                    jpeg = buf.getvalue()
+        except Exception as exc:
+            print(f"[DWM hook] read error: {exc}", flush=True)
+
+    # Tier 2: dxcam (DXGI) — captures GPU-composited frames including hardware video.
     # Works when WDA has been cleared by the capture-bypass monitor thread.
-    if _dxcam_camera is not None:
+    if jpeg is None and _dxcam_camera is not None:
         try:
             frame = _dxcam_camera.grab()
             if frame is not None:
@@ -597,14 +728,19 @@ def main():
     except Exception as exc:
         sys.exit(f"thirdeye failed to capture the screen: {exc}")
 
-    # Background thread: watches every 2 s for any WDA-protected window and
-    # injects payload_dll_persistent.dll into that process so DXGI captures it.
-    # Catches apps that open after LiteView starts (HackerRank, Netflix, etc.).
-    threading.Thread(
-        target=_capture_bypass_monitor,
-        args=(HERE / "capture-bypass",),
-        daemon=True,
-    ).start()
+    # DWM hook: inject liteview_dwm_hook.dll into dwm.exe so every frame is
+    # captured at the compositor level, bypassing WDA for all apps at once.
+    # Falls back silently if the DLL hasn't been built yet.
+    _init_dwm_hook(HERE / "module_4" / "dwm-hook" / "build" / "Release" / "liteview_dwm_hook.dll")
+
+    # Fallback background thread for per-process WDA injection (browsers, etc.)
+    # when the DWM hook is not available.
+    if _dwm_reader is None:
+        threading.Thread(
+            target=_capture_bypass_monitor,
+            args=(HERE / "capture-bypass",),
+            daemon=True,
+        ).start()
 
     app = web.Application()
     app.update(
