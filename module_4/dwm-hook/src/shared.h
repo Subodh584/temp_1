@@ -25,7 +25,7 @@ struct FrameHeader {
     uint32_t format;   // PixFmt
     uint64_t frameNum; // increments every time a new frame is written
     uint32_t ready;    // 1 = pixel data is valid for the current frameNum
-    uint32_t _pad[5];  // pad to 64 bytes
+    uint32_t _pad[9];  // pad to 64 bytes
 };
 #pragma pack(pop)
 static_assert(sizeof(FrameHeader) == 64, "FrameHeader must be 64 bytes");
