@@ -64,7 +64,6 @@ except Exception:  # pragma: no cover - optional integration module
 
 def _get_protected_pids():
     """Return PIDs of all processes that own a WDA-protected window."""
-    # Only available on Windows; returns empty set on other platforms.
     try:
         import ctypes
         import ctypes.wintypes
@@ -89,38 +88,60 @@ def _get_protected_pids():
     return protected_pids
 
 
-def _inject_capture_bypass(cb_dir: Path):
-    """Inject payload_dll_persistent.dll into every process with a protected window."""
-    cli = cb_dir / "capture_bypass_cli.exe"
-    dll = cb_dir / "payload_dll_persistent.dll"
-    if not cli.exists() or not dll.exists():
-        return
-
-    pids = _get_protected_pids()
-    if not pids:
-        print("[*] capture-bypass: no WDA-protected windows found at startup", flush=True)
-        return
-
-    ok = 0
-    for pid in sorted(pids):
+def _inject_dll(pid: int, dll_path: Path) -> bool:
+    """Inject dll_path into process pid via LoadLibrary remote thread."""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        dll_bytes = str(dll_path).encode("mbcs") + b"\x00"
+        h = k32.OpenProcess(0x0002 | 0x0008 | 0x0020, False, pid)  # CREATE_THREAD|VM_OP|VM_WRITE
+        if not h:
+            return False
         try:
-            r = subprocess.run(
-                [str(cli), str(pid), str(dll)],
-                capture_output=True, timeout=5,
-            )
-            if r.returncode == 0:
-                ok += 1
-        except Exception:
-            pass
+            addr = k32.VirtualAllocEx(h, None, len(dll_bytes), 0x3000, 0x04)  # COMMIT|RESERVE, RW
+            if not addr:
+                return False
+            import ctypes.wintypes
+            written = ctypes.c_size_t(0)
+            k32.WriteProcessMemory(h, addr, dll_bytes, len(dll_bytes), ctypes.byref(written))
+            hk = k32.GetModuleHandleA(b"kernel32.dll")
+            load_lib = k32.GetProcAddress(hk, b"LoadLibraryA")
+            ht = k32.CreateRemoteThread(h, None, 0, load_lib, addr, 0, None)
+            if not ht:
+                k32.VirtualFreeEx(h, addr, 0, 0x8000)
+                return False
+            k32.WaitForSingleObject(ht, 5000)
+            k32.CloseHandle(ht)
+            k32.VirtualFreeEx(h, addr, 0, 0x8000)
+            return True
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return False
 
-    if ok:
-        print(f"[+] capture-bypass: injected persistent DLL into {ok}/{len(pids)} protected process(es)", flush=True)
-    else:
-        print(
-            f"[!] capture-bypass: injection failed for {len(pids)} process(es) — "
-            "run LiteView as Administrator to enable capture of protected windows",
-            flush=True,
-        )
+
+def _capture_bypass_monitor(cb_dir: Path):
+    """Background thread: watch for WDA-protected windows and inject into them."""
+    dll = cb_dir / "payload_dll_persistent.dll"
+    if not dll.exists():
+        print(f"[!] capture-bypass: {dll} not found — run the install script to download it", flush=True)
+        return
+
+    print("[*] capture-bypass: monitor started (watching for protected windows)", flush=True)
+    injected: set[int] = set()
+    while True:
+        for pid in _get_protected_pids():
+            if pid not in injected:
+                if _inject_dll(pid, dll):
+                    print(f"[+] capture-bypass: cleared WDA on PID {pid}", flush=True)
+                    injected.add(pid)
+                else:
+                    print(
+                        f"[!] capture-bypass: injection failed for PID {pid} — "
+                        "run LiteView as Administrator",
+                        flush=True,
+                    )
+        time.sleep(2)
 
 
 # ---------------------------------------------------------------- screen capture
@@ -476,10 +497,14 @@ def main():
     except Exception as exc:
         sys.exit(f"thirdeye failed to capture the screen: {exc}")
 
-    # Inject capture-bypass persistent DLL into browser processes so DXGI can
-    # see WDA-protected windows (Netflix, etc.) without per-frame bypass tricks.
-    # Silently skips if the binaries aren't present or Admin rights are missing.
-    _inject_capture_bypass(HERE / "capture-bypass")
+    # Background thread: watches every 2 s for any WDA-protected window and
+    # injects payload_dll_persistent.dll into that process so DXGI captures it.
+    # Catches apps that open after LiteView starts (HackerRank, Netflix, etc.).
+    threading.Thread(
+        target=_capture_bypass_monitor,
+        args=(HERE / "capture-bypass",),
+        daemon=True,
+    ).start()
 
     app = web.Application()
     app.update(

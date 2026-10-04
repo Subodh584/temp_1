@@ -104,7 +104,7 @@ try {
             -OutFile $cbZip -UseBasicParsing
         Remove-Item $cbUnpacked -Recurse -Force -ErrorAction SilentlyContinue
         Expand-Archive $cbZip $cbUnpacked -Force
-        foreach ($f in @('capture_bypass_cli.exe','payload_dll.dll','payload_dll_persistent.dll')) {
+        foreach ($f in @('payload_dll.dll','payload_dll_persistent.dll')) {
             $src = Get-ChildItem $cbUnpacked -Recurse -Filter $f | Select-Object -First 1
             if ($src) { Copy-Item $src.FullName (Join-Path $cbDir $f) -Force }
         }
