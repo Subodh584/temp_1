@@ -32,6 +32,11 @@ PASSWORD_FILE = Path.home() / ".liteview_password"
 LOG_FILE = Path.home() / ".liteview.log"
 MSS = getattr(mss, "MSS", None) or mss.mss  # mss >= 10 renamed the class
 
+try:
+    from module_2.thirdeye import ThirdEyeModule
+except Exception:  # pragma: no cover - optional integration module
+    ThirdEyeModule = None
+
 # ---------------------------------------------------------------- screen capture
 
 _capture = threading.local()  # mss handles are not thread-safe; keep one per thread
@@ -178,8 +183,6 @@ async def stream_frames(ws, app, acked):
             force = False
             acked.clear()
             await ws.send_bytes(jpeg)
-            # Wait until the viewer has drawn the frame, so a slow network
-            # drops frames instead of building up seconds of lag.
             try:
                 await asyncio.wait_for(acked.wait(), timeout=5)
             except asyncio.TimeoutError:
@@ -200,12 +203,10 @@ async def ws_handler(request):
         auth = {}
     if not hmac.compare_digest(str(auth.get("pw", "")).encode(), app["password"].encode()):
         print(f"[!] Rejected {peer}: wrong password")
-        await asyncio.sleep(1)  # slow down password guessing
+        await asyncio.sleep(1)
         await ws.send_str(json.dumps({"t": "error", "msg": "Wrong password"}))
         await ws.close(code=4001)
         return ws
-    # Only one viewer at a time: a new login takes over, so a stale session
-    # (closed laptop lid, dropped network) can never lock you out.
     session = app["session"]
     old = session["ws"]
     if old is not None and not old.closed:
@@ -214,7 +215,6 @@ async def ws_handler(request):
             await old.send_str(json.dumps({"t": "error", "msg": "Another viewer took over this session"}))
         except Exception:
             pass
-        # Don't wait for the old peer's close handshake; it may be unreachable.
         asyncio.create_task(old.close(code=4002))
     session["ws"] = ws
     print(f"[+] {peer} connected")
@@ -262,7 +262,7 @@ def load_password(cli_password):
 def lan_ip():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
-            s.connect(("10.255.255.255", 1))  # no packet is sent; just picks the LAN interface
+            s.connect(("10.255.255.255", 1))
             return s.getsockname()[0]
         except OSError:
             return "127.0.0.1"
@@ -275,7 +275,7 @@ def tailscale_ip():
     """This computer's Tailscale IPv4 address, or None if Tailscale isn't connected."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
-            s.connect(("100.100.100.100", 1))  # Tailscale's own resolver; routes via the tailnet
+            s.connect(("100.100.100.100", 1))
             ip = s.getsockname()[0]
         except OSError:
             return None
@@ -283,7 +283,6 @@ def tailscale_ip():
 
 
 def wait_for_tailscale():
-    # When started at boot, Tailscale may not be connected yet.
     ip = tailscale_ip()
     if ip is None:
         print("Waiting for Tailscale to connect...", flush=True)
@@ -294,7 +293,7 @@ def wait_for_tailscale():
 
 
 def main():
-    if sys.stdout is None:  # started with pythonw (no console): write to a log file instead
+    if sys.stdout is None:
         sys.stdout = sys.stderr = open(LOG_FILE, "a", buffering=1, encoding="utf-8")
 
     parser = argparse.ArgumentParser(description="LiteView host: share this screen and allow remote control.")
@@ -308,7 +307,12 @@ def main():
                         help="only accept connections through Tailscale (waits for Tailscale if it isn't up yet)")
     parser.add_argument("--show-address", action="store_true",
                         help="print the addresses and password to connect with, then exit")
+    parser.add_argument("--module", "--module_2", "--third-eye", "--thirdeye",
+                        action="append", default=[],
+                        help="enable optional LiteView modules, e.g. 'thirdeye'")
     args = parser.parse_args()
+
+    password = load_password(args.password)
 
     if args.show_address:
         ts_ip = tailscale_ip()
@@ -316,7 +320,7 @@ def main():
               else "  Tailscale not connected - only reachable on this local network.")
         if not args.tailscale_only:
             print(f"  From the same network:       http://{lan_ip()}:{args.port}")
-        print(f"  Password:                    {load_password(args.password)}")
+        print(f"  Password:                    {password}")
         return
 
     with MSS() as sct:
@@ -324,13 +328,30 @@ def main():
 
     app = web.Application()
     app.update(
-        password=load_password(args.password), fps=args.fps, quality=args.quality,
-        max_width=args.max_width, view_only=args.view_only, session={"ws": None},
+        password=password,
+        fps=args.fps,
+        quality=args.quality,
+        max_width=args.max_width,
+        view_only=args.view_only,
+        session={"ws": None},
         injector=InputInjector(monitor),
         capture_pool=ThreadPoolExecutor(max_workers=1, thread_name_prefix="capture"),
     )
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
+
+    for requested in args.module:
+        requested_name = requested.strip().lower().replace("_", "-")
+        if requested_name in {"thirdeye", "third-eye", "module-2", "module_2"}:
+            if ThirdEyeModule is None:
+                print("[!] ThirdEye module is unavailable in this checkout.")
+                continue
+            module = ThirdEyeModule()
+            module.register(app, frame_provider=grab_jpeg)
+            app.setdefault("modules", []).append(module.name)
+            print("[+] ThirdEye module enabled")
+        else:
+            print(f"[!] Unknown module '{requested}' (supported: thirdeye)")
 
     if args.tailscale_only:
         ts_ip = wait_for_tailscale()
@@ -349,6 +370,8 @@ def main():
     print(f"  Password:                    {app['password']}")
     print(f"  Screen:                      {monitor['width']}x{monitor['height']}"
           + ("  (view only)" if args.view_only else ""))
+    if app.get("modules"):
+        print(f"  Modules:                     {', '.join(app['modules'])}")
     web.run_app(app, host=bind_host, port=args.port, print=None)
 
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # LiteView one-command installer for Linux (X11) and macOS:
 #
-#   curl -fsSL https://raw.githubusercontent.com/Subodh584/LiteView/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Subodh584/temp_1/main/install.sh | bash
 #
 # Downloads LiteView, installs its Python packages, installs Tailscale and signs
 # this computer in, makes LiteView start at login, and starts it now.
 # Re-run it to update.
 set -euo pipefail
 
-REPO=Subodh584/LiteView
+REPO=Subodh584/temp_1
 DIR="${LITEVIEW_DIR:-$HOME/.local/share/liteview}"
 LOG="$HOME/.liteview.log"
 

@@ -11,12 +11,12 @@ On the computer you want to control, run:
 
 **Windows** (PowerShell):
 ```powershell
-irm https://raw.githubusercontent.com/Subodh584/LiteView/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Subodh584/temp_1/main/install.ps1 | iex
 ```
 
 **Linux (X11) / macOS** (terminal):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Subodh584/LiteView/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Subodh584/temp_1/main/install.sh | bash
 ```
 
 This one command:
@@ -43,7 +43,17 @@ The host prints the URL and password. The password is generated once and saved i
 `~/.liteview_password`, so it stays the same between runs. Override it with
 `--password` or the `LITEVIEW_PASSWORD` env var.
 
-Options: `--port`, `--fps`, `--quality`, `--max-width`, `--view-only`, `--tailscale-only`.
+Options: `--port`, `--fps`, `--quality`, `--max-width`, `--view-only`, `--tailscale-only`, and the optional `--module thirdeye` flag to enable the bundled ThirdEye module adapter.
+
+### Optional module integration
+
+The repository also includes a lightweight `module_2` adapter for a ThirdEye-style Python integration. It is disabled by default but can be enabled on the host with:
+
+```bash
+python host.py --module thirdeye
+```
+
+This exposes `/module/third-eye`, `/module/third-eye/health`, and `/module/third-eye/info` without changing the normal LiteView remote-desktop behavior.
 
 ## Connect over the internet (Tailscale)
 

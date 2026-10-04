@@ -1,6 +1,6 @@
 # LiteView one-command installer for Windows. Run in PowerShell:
 #
-#   irm https://raw.githubusercontent.com/Subodh584/LiteView/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/Subodh584/temp_1/main/install.ps1 | iex
 #
 # Downloads LiteView, installs Python and Tailscale if needed, signs this computer
 # in to Tailscale, opens the firewall port, makes LiteView start at login, and
@@ -10,7 +10,7 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # makes Invoke-WebRequest much faster
 
-$Repo = 'Subodh584/LiteView'
+$Repo = 'Subodh584/temp_1'
 $Dir = Join-Path $env:LOCALAPPDATA 'LiteView'
 $Port = 8765
 $Log = Join-Path $HOME '.liteview.log'
