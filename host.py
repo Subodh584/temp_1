@@ -38,6 +38,15 @@ except ImportError:
         import eye3 as _eye3
     except ImportError:
         _eye3 = None
+
+# dxcam uses DXGI Desktop Duplication, which captures GPU-composited frames
+# (including hardware-decoded video like Netflix) — something BitBlt cannot do.
+# We use it alongside thirdeye: thirdeye clears WDA_EXCLUDEFROMCAPTURE, dxcam
+# captures during that window.
+try:
+    import dxcam as _dxcam
+except ImportError:
+    _dxcam = None
 PASSWORD_FILE = Path.home() / ".liteview_password"
 LOG_FILE = Path.home() / ".liteview.log"
 
@@ -50,29 +59,83 @@ except Exception:  # pragma: no cover - optional integration module
 
 _capture = threading.local()  # thirdeye sessions are not thread-safe; keep one per thread
 
-# ThirdEyeOptions with bypass_protection=True (the default) is what actually
-# makes thirdeye different from a plain BitBlt: before each capture it injects a
-# remote thread into every WDA_MONITOR/WDA_EXCLUDEFROMCAPTURE-protected process
-# via direct NT syscalls, temporarily clears the display affinity, captures, then
-# signals the remote thread to restore it.  We ask for JPEG directly so we skip
-# the BMP->PIL->JPEG roundtrip.
-_TE_OPTS = None  # set once _eye3 is confirmed available
+# Shared dxcam camera instance (DXGI Desktop Duplication).
+_dxcam_camera = None
+_dxcam_lock = threading.Lock()
+
+# ThirdEye options: bypass_protection=True injects into every WDA-protected
+# process and clears display affinity before capture, restoring it after.
+_TE_OPTS_BYPASS = None   # bypass + BitBlt (fallback)
+_TE_OPTS_BYPASS_ONLY = None  # bypass only, no encode (for dxcam path)
+
+
+def _init_capture(quality):
+    global _dxcam_camera, _TE_OPTS_BYPASS, _TE_OPTS_BYPASS_ONLY
+    if _TE_OPTS_BYPASS is None:
+        _TE_OPTS_BYPASS = _eye3.ThirdEyeOptions(
+            format=_eye3.ThirdeyeFormat.JPEG,
+            quality=quality,
+            bypass_protection=True,
+        )
+        _TE_OPTS_BYPASS_ONLY = _eye3.ThirdEyeOptions(
+            format=_eye3.ThirdeyeFormat.BMP,  # smallest valid format; result discarded
+            quality=0,
+            bypass_protection=True,
+        )
+    if _dxcam is not None and _dxcam_camera is None:
+        with _dxcam_lock:
+            if _dxcam_camera is None:
+                _dxcam_camera = _dxcam.create(output_color="RGB")
 
 
 def grab_jpeg(max_width, quality, force):
     """Return the screen as JPEG bytes, or None if nothing changed since last grab."""
-    global _TE_OPTS
     if not hasattr(_capture, "session"):
         _capture.session = _eye3.ThirdEyeSession()
         _capture.last_digest = None
-        if _TE_OPTS is None:
-            _TE_OPTS = _eye3.ThirdEyeOptions(
-                format=_eye3.ThirdeyeFormat.JPEG,
-                quality=quality,
-                bypass_protection=True,
-            )
+        _init_capture(quality)
 
-    jpeg = _capture.session.capture_to_buffer(_TE_OPTS)
+    if _dxcam_camera is not None:
+        # Two-phase capture:
+        #   1. Run thirdeye's bypass on a background thread — it injects into every
+        #      WDA_EXCLUDEFROMCAPTURE-protected process and holds WDA cleared while
+        #      its own BitBlt runs (~150–300 ms window).
+        #   2. Fire dxcam (DXGI) ~120 ms in, while WDA is still cleared — DXGI can
+        #      then see GPU-composited content (hardware video, DRM windows) that
+        #      BitBlt cannot.
+        bypass_ready = threading.Event()
+        bypass_done = threading.Event()
+
+        def run_bypass():
+            bypass_ready.set()
+            try:
+                _capture.session.capture_to_buffer(_TE_OPTS_BYPASS_ONLY)
+            except Exception:
+                pass
+            bypass_done.set()
+
+        t = threading.Thread(target=run_bypass, daemon=True)
+        t.start()
+        bypass_ready.wait()
+        time.sleep(0.12)  # let thirdeye's injections take effect
+
+        frame = _dxcam_camera.grab()
+        bypass_done.wait(timeout=1.0)
+
+        if frame is None:
+            return None  # no change detected by dxcam
+
+        img = Image.fromarray(frame)
+        if img.width > max_width:
+            img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=quality)
+        jpeg = buf.getvalue()
+    else:
+        # dxcam not available: fall back to thirdeye's own BitBlt capture.
+        # Works for WDA-only protected windows; GPU-rendered content stays black.
+        jpeg = _capture.session.capture_to_buffer(_TE_OPTS_BYPASS)
+
     digest = hashlib.blake2b(jpeg, digest_size=16).digest()
     if digest == _capture.last_digest and not force:
         return None
