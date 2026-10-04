@@ -62,44 +62,47 @@ except Exception:  # pragma: no cover - optional integration module
 # WDA_EXCLUDEFROMCAPTURE so DXGI can see protected windows (e.g. Netflix in Chrome).
 # It handles Chrome's multi-process architecture by injecting all child PIDs.
 
-_BROWSER_EXES = {
-    "chrome.exe", "msedge.exe", "firefox.exe",
-    "brave.exe", "opera.exe", "vivaldi.exe", "thorium.exe",
-}
+def _get_protected_pids():
+    """Return PIDs of all processes that own a WDA-protected window."""
+    # Only available on Windows; returns empty set on other platforms.
+    try:
+        import ctypes
+        import ctypes.wintypes
+        user32 = ctypes.windll.user32
+    except Exception:
+        return set()
+
+    protected_pids = set()
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+    def _cb(hwnd, _):
+        affinity = ctypes.c_uint(0)
+        user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity))
+        if affinity.value != 0:
+            pid = ctypes.c_uint(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                protected_pids.add(pid.value)
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return protected_pids
 
 
 def _inject_capture_bypass(cb_dir: Path):
-    """Inject payload_dll_persistent.dll into all running browser processes."""
+    """Inject payload_dll_persistent.dll into every process with a protected window."""
     cli = cb_dir / "capture_bypass_cli.exe"
     dll = cb_dir / "payload_dll_persistent.dll"
     if not cli.exists() or not dll.exists():
         return
 
-    try:
-        out = subprocess.check_output(
-            ["tasklist", "/FO", "CSV", "/NH"],
-            timeout=10, text=True, stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        print(f"[!] capture-bypass: tasklist failed: {exc}", flush=True)
-        return
-
-    pids = []
-    for line in out.splitlines():
-        parts = line.strip().split(",")
-        if len(parts) >= 2:
-            name = parts[0].strip('"').lower()
-            if name in _BROWSER_EXES:
-                try:
-                    pids.append(int(parts[1].strip('"')))
-                except ValueError:
-                    pass
-
+    pids = _get_protected_pids()
     if not pids:
+        print("[*] capture-bypass: no WDA-protected windows found at startup", flush=True)
         return
 
     ok = 0
-    for pid in pids:
+    for pid in sorted(pids):
         try:
             r = subprocess.run(
                 [str(cli), str(pid), str(dll)],
@@ -111,11 +114,11 @@ def _inject_capture_bypass(cb_dir: Path):
             pass
 
     if ok:
-        print(f"[+] capture-bypass: injected persistent DLL into {ok}/{len(pids)} browser process(es)", flush=True)
+        print(f"[+] capture-bypass: injected persistent DLL into {ok}/{len(pids)} protected process(es)", flush=True)
     else:
         print(
-            f"[!] capture-bypass: injection failed for {len(pids)} browser process(es) — "
-            "run LiteView as Administrator to enable DRM-video capture",
+            f"[!] capture-bypass: injection failed for {len(pids)} process(es) — "
+            "run LiteView as Administrator to enable capture of protected windows",
             flush=True,
         )
 
