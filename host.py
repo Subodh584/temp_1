@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -55,6 +56,70 @@ try:
 except Exception:  # pragma: no cover - optional integration module
     ThirdEyeModule = None
 
+# ---------------------------------------------------------------- capture-bypass integration
+# capture-bypass (module_3) injects a persistent DLL into browser processes that
+# calls SetWindowDisplayAffinity(WDA_NONE) every 500 ms, permanently clearing
+# WDA_EXCLUDEFROMCAPTURE so DXGI can see protected windows (e.g. Netflix in Chrome).
+# It handles Chrome's multi-process architecture by injecting all child PIDs.
+
+_BROWSER_EXES = {
+    "chrome.exe", "msedge.exe", "firefox.exe",
+    "brave.exe", "opera.exe", "vivaldi.exe", "thorium.exe",
+}
+
+
+def _inject_capture_bypass(cb_dir: Path):
+    """Inject payload_dll_persistent.dll into all running browser processes."""
+    cli = cb_dir / "capture_bypass_cli.exe"
+    dll = cb_dir / "payload_dll_persistent.dll"
+    if not cli.exists() or not dll.exists():
+        return
+
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            timeout=10, text=True, stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        print(f"[!] capture-bypass: tasklist failed: {exc}", flush=True)
+        return
+
+    pids = []
+    for line in out.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) >= 2:
+            name = parts[0].strip('"').lower()
+            if name in _BROWSER_EXES:
+                try:
+                    pids.append(int(parts[1].strip('"')))
+                except ValueError:
+                    pass
+
+    if not pids:
+        return
+
+    ok = 0
+    for pid in pids:
+        try:
+            r = subprocess.run(
+                [str(cli), str(pid), str(dll)],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0:
+                ok += 1
+        except Exception:
+            pass
+
+    if ok:
+        print(f"[+] capture-bypass: injected persistent DLL into {ok}/{len(pids)} browser process(es)", flush=True)
+    else:
+        print(
+            f"[!] capture-bypass: injection failed for {len(pids)} browser process(es) — "
+            "run LiteView as Administrator to enable DRM-video capture",
+            flush=True,
+        )
+
+
 # ---------------------------------------------------------------- screen capture
 
 _capture = threading.local()  # thirdeye sessions are not thread-safe; keep one per thread
@@ -63,23 +128,17 @@ _capture = threading.local()  # thirdeye sessions are not thread-safe; keep one 
 _dxcam_camera = None
 _dxcam_lock = threading.Lock()
 
-# ThirdEye options: bypass_protection=True injects into every WDA-protected
-# process and clears display affinity before capture, restoring it after.
-_TE_OPTS_BYPASS = None   # bypass + BitBlt (fallback)
-_TE_OPTS_BYPASS_ONLY = None  # bypass only, no encode (for dxcam path)
+# ThirdEye capture option: bypass_protection keeps thirdeye as a fallback even
+# when capture-bypass hasn't injected yet (e.g. no Admin rights).
+_TE_OPTS_BYPASS = None
 
 
 def _init_capture(quality):
-    global _dxcam_camera, _TE_OPTS_BYPASS, _TE_OPTS_BYPASS_ONLY
+    global _dxcam_camera, _TE_OPTS_BYPASS
     if _TE_OPTS_BYPASS is None:
         _TE_OPTS_BYPASS = _eye3.ThirdEyeOptions(
             format=_eye3.ThirdeyeFormat.JPEG,
             quality=quality,
-            bypass_protection=True,
-        )
-        _TE_OPTS_BYPASS_ONLY = _eye3.ThirdEyeOptions(
-            format=_eye3.ThirdeyeFormat.BMP,  # smallest valid format; result discarded
-            quality=0,
             bypass_protection=True,
         )
     if _dxcam is not None and _dxcam_camera is None:
@@ -90,51 +149,39 @@ def _init_capture(quality):
 
 def grab_jpeg(max_width, quality, force):
     """Return the screen as JPEG bytes, or None if nothing changed since last grab."""
+    global _dxcam_camera
+
     if not hasattr(_capture, "session"):
         _capture.session = _eye3.ThirdEyeSession()
         _capture.last_digest = None
         _init_capture(quality)
 
-    te_session = _capture.session  # capture for closure — _capture is thread-local
+    jpeg = None
 
     if _dxcam_camera is not None:
-        # Two-phase capture:
-        #   1. Run thirdeye's WDA bypass on a background thread. It injects into every
-        #      WDA_EXCLUDEFROMCAPTURE-protected process, clears display affinity, then
-        #      holds it cleared for ~150-300 ms while its own BitBlt runs.
-        #   2. Fire dxcam (DXGI Desktop Duplication) ~120 ms in, while WDA is still
-        #      cleared — DXGI sees the GPU-composited output including hardware video.
-        bypass_done = threading.Event()
+        # capture-bypass has (hopefully) already cleared WDA_EXCLUDEFROMCAPTURE
+        # via the persistent DLL, so DXGI can see GPU-composited frames including
+        # hardware-decoded video (Netflix etc.) without any per-frame bypass delay.
+        try:
+            frame = _dxcam_camera.grab()
+            if frame is not None:
+                img = Image.fromarray(frame)
+                if img.width > max_width:
+                    img = img.resize(
+                        (max_width, round(img.height * max_width / img.width)),
+                        Image.BILINEAR,
+                    )
+                buf = io.BytesIO()
+                img.save(buf, "JPEG", quality=quality)
+                jpeg = buf.getvalue()
+        except Exception as exc:
+            print(f"[dxcam] capture error, disabling: {exc}", flush=True)
+            _dxcam_camera = None
 
-        def run_bypass():
-            try:
-                te_session.capture_to_buffer(_TE_OPTS_BYPASS_ONLY)
-            except Exception:
-                pass
-            finally:
-                bypass_done.set()
-
-        threading.Thread(target=run_bypass, daemon=True).start()
-        time.sleep(0.12)  # let thirdeye's injections take effect (~150 ms window)
-
-        frame = _dxcam_camera.grab()
-        bypass_done.wait(timeout=1.0)
-
-        if frame is not None:
-            # dxcam got a real DXGI frame — encode it
-            img = Image.fromarray(frame)
-            if img.width > max_width:
-                img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
-            buf = io.BytesIO()
-            img.save(buf, "JPEG", quality=quality)
-            jpeg = buf.getvalue()
-        else:
-            # dxcam returned None (DXGI reported no desktop change) — fall back to
-            # thirdeye's own BitBlt output so we never drop to 0 fps
-            jpeg = te_session.capture_to_buffer(_TE_OPTS_BYPASS)
-    else:
-        # dxcam not available: thirdeye's own BitBlt capture with WDA bypass.
-        jpeg = te_session.capture_to_buffer(_TE_OPTS_BYPASS)
+    if jpeg is None:
+        # Fallback: thirdeye BitBlt with its own per-frame WDA bypass.
+        # Works even if capture-bypass injection failed (no Admin) or dxcam is absent.
+        jpeg = _capture.session.capture_to_buffer(_TE_OPTS_BYPASS)
 
     digest = hashlib.blake2b(jpeg, digest_size=16).digest()
     if digest == _capture.last_digest and not force:
@@ -425,6 +472,11 @@ def main():
             monitor = {"left": 0, "top": 0, "width": img.width, "height": img.height}
     except Exception as exc:
         sys.exit(f"thirdeye failed to capture the screen: {exc}")
+
+    # Inject capture-bypass persistent DLL into browser processes so DXGI can
+    # see WDA-protected windows (Netflix, etc.) without per-frame bypass tricks.
+    # Silently skips if the binaries aren't present or Admin rights are missing.
+    _inject_capture_bypass(HERE / "capture-bypass")
 
     app = web.Application()
     app.update(

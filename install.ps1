@@ -93,6 +93,27 @@ try {
     & $venvPy -m pip install --disable-pip-version-check -q -r (Join-Path $Dir 'requirements.txt')
     if ($LASTEXITCODE) { throw 'Installing Python packages failed (see the messages above).' }
 
+    # ---- capture-bypass binaries (clears WDA for browsers so Netflix works) ---
+    Say 'Downloading capture-bypass (DRM-video bypass)...'
+    $cbDir = Join-Path $Dir 'capture-bypass'
+    New-Item -ItemType Directory -Force $cbDir | Out-Null
+    $cbZip     = Join-Path $env:TEMP 'cb.zip'
+    $cbUnpacked = Join-Path $env:TEMP 'cb-unpacked'
+    try {
+        Invoke-WebRequest 'https://github.com/Londopy/capture-bypass/releases/download/v3.6.5/capture-bypass-3.6.5-portable-x64.zip' `
+            -OutFile $cbZip -UseBasicParsing
+        Remove-Item $cbUnpacked -Recurse -Force -ErrorAction SilentlyContinue
+        Expand-Archive $cbZip $cbUnpacked -Force
+        foreach ($f in @('capture_bypass_cli.exe','payload_dll.dll','payload_dll_persistent.dll')) {
+            $src = Get-ChildItem $cbUnpacked -Recurse -Filter $f | Select-Object -First 1
+            if ($src) { Copy-Item $src.FullName (Join-Path $cbDir $f) -Force }
+        }
+        Remove-Item $cbZip, $cbUnpacked -Recurse -Force -ErrorAction SilentlyContinue
+        Say 'capture-bypass ready.'
+    } catch {
+        Warn "capture-bypass download failed (DRM video in browsers may show as black): $($_.Exception.Message)"
+    }
+
     # ---- Tailscale: install and sign in -------------------------------------------
     $tailscale = Find-Tailscale
     if (-not $tailscale) {
