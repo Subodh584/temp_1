@@ -11,7 +11,7 @@ if errorlevel 1 (
 if not exist build mkdir build
 cd build
 
-cmake .. -G "Visual Studio 17 2022" -A x64
+cmake .. -A x64
 if errorlevel 1 ( echo CMake configure failed. & pause & exit /b 1 )
 
 cmake --build . --config Release
