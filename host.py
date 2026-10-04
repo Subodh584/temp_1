@@ -175,11 +175,16 @@ async def stream_frames(ws, app, acked):
     loop = asyncio.get_running_loop()
     interval = 1 / app["fps"]
     force = True
+    third_eye = app.get("third_eye")
     while not ws.closed:
         started = loop.time()
         jpeg = await loop.run_in_executor(
             app["capture_pool"], grab_jpeg, app["max_width"], app["quality"], force)
         if jpeg:
+            if third_eye is not None:
+                third_eye.observe(jpeg)
+                if third_eye.last_frame:
+                    jpeg = third_eye.last_frame
             force = False
             acked.clear()
             await ws.send_bytes(jpeg)
@@ -218,6 +223,9 @@ async def ws_handler(request):
         asyncio.create_task(old.close(code=4002))
     session["ws"] = ws
     print(f"[+] {peer} connected")
+    third_eye = app.get("third_eye")
+    if third_eye is not None:
+        await ws.send_str(json.dumps({"t": "module", "module": "thirdeye", "enabled": True, "status": "tracking"}))
     await ws.send_str(json.dumps({"t": "ok"}))
     acked = asyncio.Event()
     injector = app["injector"]
@@ -348,6 +356,7 @@ def main():
                 continue
             module = ThirdEyeModule()
             module.register(app, frame_provider=grab_jpeg)
+            app["third_eye"] = module
             app.setdefault("modules", []).append(module.name)
             print("[+] ThirdEye module enabled")
         else:

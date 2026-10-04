@@ -50,7 +50,16 @@ let ws = null;
 let password = '';
 let authed = false;
 let wantConnected = false;
+let thirdEyeStatus = '';
 let frames = 0, bytes = 0;
+
+function refreshStatus() {
+  if (authed) {
+    let label = `Connected to ${location.host} · ${frames} fps · ${(bytes / 1024).toFixed(0)} KB/s`;
+    if (thirdEyeStatus) label += ` · ${thirdEyeStatus}`;
+    statusEl.textContent = label;
+  }
+}
 
 function send(obj) {
   if (ws && ws.readyState === WebSocket.OPEN && authed) ws.send(JSON.stringify(obj));
@@ -75,6 +84,9 @@ function connect() {
         authed = true;
         loginEl.hidden = true;
         canvas.focus();
+      } else if (msg.t === 'module') {
+        thirdEyeStatus = msg.enabled ? `ThirdEye ${msg.status || 'active'}` : 'ThirdEye inactive';
+        refreshStatus();
       } else if (msg.t === 'error') {
         wantConnected = false;
         showLogin(msg.msg);
@@ -139,7 +151,7 @@ document.addEventListener('fullscreenchange', () => {
 
 setInterval(() => {
   if (authed) {
-    statusEl.textContent = `Connected to ${location.host} · ${frames} fps · ${(bytes / 1024).toFixed(0)} KB/s`;
+    refreshStatus();
   }
   frames = 0; bytes = 0;
 }, 1000);
