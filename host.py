@@ -19,7 +19,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import mss  # import before pynput: on Windows mss makes the process DPI-aware
 from aiohttp import WSMsgType, web
 from PIL import Image
 from pynput.keyboard import Controller as KeyboardController
@@ -41,7 +40,6 @@ except ImportError:
         _eye3 = None
 PASSWORD_FILE = Path.home() / ".liteview_password"
 LOG_FILE = Path.home() / ".liteview.log"
-MSS = getattr(mss, "MSS", None) or mss.mss  # mss >= 10 renamed the class
 
 try:
     from module_2.thirdeye import ThirdEyeModule
@@ -50,46 +48,23 @@ except Exception:  # pragma: no cover - optional integration module
 
 # ---------------------------------------------------------------- screen capture
 
-_capture = threading.local()  # mss handles are not thread-safe; keep one per thread
+_capture = threading.local()  # thirdeye sessions are not thread-safe; keep one per thread
 
 
 def grab_jpeg(max_width, quality, force):
     """Return the screen as JPEG bytes, or None if nothing changed since last grab."""
-    if not hasattr(_capture, "sct"):
-        _capture.sct = MSS()
+    if not hasattr(_capture, "session"):
+        _capture.session = _eye3.ThirdEyeSession()
         _capture.last_digest = None
-        _capture.te_session = None
-        if _eye3 is not None:
-            try:
-                _capture.te_session = _eye3.ThirdEyeSession()
-            except Exception as exc:
-                print(f"[thirdeye] not available: {exc}", flush=True)
 
-    if _capture.te_session is not None:
-        try:
-            opts = _eye3.ThirdEyeOptions(format=_eye3.ThirdeyeFormat.BMP, quality=0)
-            bmp_bytes = _capture.te_session.capture_to_buffer(opts)
-            digest = hashlib.blake2b(bmp_bytes, digest_size=16).digest()
-            if digest == _capture.last_digest and not force:
-                return None
-            _capture.last_digest = digest
-            img = Image.open(io.BytesIO(bmp_bytes)).convert("RGB")
-            if img.width > max_width:
-                img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
-            buf = io.BytesIO()
-            img.save(buf, "JPEG", quality=quality)
-            return buf.getvalue()
-        except Exception as exc:
-            print(f"[thirdeye] capture failed, falling back to mss: {exc}", flush=True)
-            _capture.te_session = None
-
-    shot = _capture.sct.grab(_capture.sct.monitors[1])
-    digest = hashlib.blake2b(shot.bgra, digest_size=16).digest()
+    opts = _eye3.ThirdEyeOptions(format=_eye3.ThirdeyeFormat.BMP, quality=0)
+    bmp_bytes = _capture.session.capture_to_buffer(opts)
+    digest = hashlib.blake2b(bmp_bytes, digest_size=16).digest()
     if digest == _capture.last_digest and not force:
         return None
     _capture.last_digest = digest
 
-    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    img = Image.open(io.BytesIO(bmp_bytes)).convert("RGB")
     if img.width > max_width:
         img = img.resize((max_width, round(img.height * max_width / img.width)), Image.BILINEAR)
     buf = io.BytesIO()
@@ -367,17 +342,16 @@ def main():
         print(f"  Password:                    {password}")
         return
 
-    with MSS() as sct:
-        monitor = dict(sct.monitors[1])
-
-    capture_backend = "mss"
-    if _eye3 is not None:
-        try:
-            with _eye3.ThirdEyeSession():
-                capture_backend = "thirdeye"
-        except Exception as exc:
-            print(f"[thirdeye] probe failed, using mss: {exc}", flush=True)
-    print(f"  Capture backend:             {capture_backend}")
+    if _eye3 is None:
+        sys.exit("thirdeye (eye3) is not installed. Run: pip install eye3")
+    try:
+        with _eye3.ThirdEyeSession() as probe:
+            bmp = probe.capture_to_buffer(_eye3.ThirdEyeOptions(format=_eye3.ThirdeyeFormat.BMP, quality=0))
+            from PIL import Image as _PIL
+            img = _PIL.open(io.BytesIO(bmp))
+            monitor = {"left": 0, "top": 0, "width": img.width, "height": img.height}
+    except Exception as exc:
+        sys.exit(f"thirdeye failed to capture the screen: {exc}")
 
     app = web.Application()
     app.update(
@@ -389,7 +363,7 @@ def main():
         session={"ws": None},
         injector=InputInjector(monitor),
         capture_pool=ThreadPoolExecutor(max_workers=1, thread_name_prefix="capture"),
-        capture_backend=capture_backend,
+        capture_backend="thirdeye",
     )
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
